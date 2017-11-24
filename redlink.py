@@ -68,7 +68,7 @@ def sort_links_desc(red_links):
     # so, for now, keep it and log it.
     empty = link_count.pop("", None)
     if empty is not None:
-        logging.warning("Found empty title in link_count. n={}".format(empty), file=sys.stdin)
+        logging.warning("Found empty title in link_count. n={}".format(empty))
 
     # Filter out links that contain "#".
     links = [(t, n) for t, n in link_count.items() if "#" not in t]
