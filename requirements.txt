@@ -1,9 +1,1 @@
-certifi==2017.7.27.1
-chardet==3.0.4
-idna==2.6
-mwparserfromhell==0.5
-oauthlib==2.0.4
-pywikibot==3.0.20171003
-requests==2.18.4
-requests-oauthlib==0.8.0
-urllib3==1.22
+PyMySQL==0.7.11

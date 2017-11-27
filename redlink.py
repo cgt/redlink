@@ -1,99 +1,98 @@
 #!/usr/bin/env python3
 
-# Copyright Christoffer G. Thomsen 2017
-# Distributed under the Boost Software License, Version 1.0.
-#    (See accompanying file LICENSE or copy at
-#     http://www.boost.org/LICENSE_1_0.txt)
+# vim: et:ts=4:sw=4:sts=4
 
+from collections import namedtuple
 import argparse
-from collections import defaultdict
 import logging
-from operator import itemgetter
+import os.path
 import sys
 
-import pywikibot
-import pywikibot.xmlreader
-
-import mwparserfromhell
+import pymysql
 
 
-def normalize_title(title):
-    return str(title).lower().strip()
+Redlink = namedtuple("Redlink", ["title", "n"])
 
 
-def find_red_links(category, dump_path):
-    """
-    Args:
-        category: Site category to search for red links in.
-        dump: file object containing the XML dump.
+def redlinks(conn, categories):
+    assert len(categories) >= 1
 
-    Returns:
-        A dict mapping page titles to sets of red links in those pages.
-    """
-
-    logging.info("find_red_links: gathering titles in dump")
-    dump = pywikibot.xmlreader.XmlDump(dump_path).parse()
-    dump_titles = {normalize_title(str(p.title)) for p in dump if p.ns == "0"}
-    logging.info("find_red_links: finished gathering titles")
-
-    red_links = {}
-    cat = pywikibot.Category(pywikibot.Site(), title=category)
-    articles = {p.title() for p in cat.articles(recurse=True, namespaces=0, content=False)}
-
-    dump = pywikibot.xmlreader.XmlDump(dump_path).parse()
-    for page in (p for p in dump if p.title in articles):
-        txt = mwparserfromhell.parse(page.text)
-        links = (l for l in txt.ifilter_wikilinks() if ":" not in l.title)
-        red = set()
-        for link in links:
-            title = normalize_title(link.title)
-            if title not in dump_titles:
-                red.add(str(link.title))
-        if len(red) > 0:
-            red_links[str(page.title)] = red
-            logging.info("found {} red links in page {}".format(len(red), str(page.title)))
-
-    return red_links
+    with conn.cursor() as cur:
+        q = """
+            SELECT pl_title, count(pl_from) AS n FROM
+            (
+                SELECT DISTINCT pl_title, pl_from FROM pagelinks
+                JOIN categorylinks ON pl_from = cl_from
+                LEFT JOIN page ON pl_title = page_title
+                WHERE
+                    cl_to IN ({0})
+                    AND
+                    cl_type = 'page'
+                    AND
+                    page_id IS NULL
+            ) AS tmp
+            GROUP BY pl_title
+            ORDER BY n DESC
+            """
+        q = q.format(", ".join(["%s"] * len(categories)))
+        cur.execute(q, (*categories,))
+        return [Redlink(x[0].decode("utf-8"), x[1]) for x in cur.fetchall()]
 
 
-def sort_links_desc(red_links):
-    # Count amount of each red link
-    link_count = defaultdict(int)
-    for links in red_links.values():
-        for link in links:
-            link_count[link] += 1
-
-    # Delete empty link from dict. My original script did something that was
-    # functionally equivalent to this, not sure if it's actually necessary,
-    # so, for now, keep it and log it.
-    empty = link_count.pop("", None)
-    if empty is not None:
-        logging.warning("Found empty title in link_count. n={}".format(empty))
-
-    # Filter out links that contain "#".
-    links = [(t, n) for t, n in link_count.items() if "#" not in t]
-
-    # Sort links in descending order by amount of links.
-    return sorted(links, key=itemgetter(1), reverse=True)
+def all_subcats(conn, category):
+    logging.debug("Getting subcategories for category {}.".format(category))
+    with conn.cursor() as cur:
+        q = """
+            SELECT page_title FROM categorylinks
+            JOIN page ON cl_from = page_id
+            WHERE cl_to=%s and cl_type = 'subcat'
+            """
+        cur.execute(q, (category,))
+        subcats = {x[0].decode("utf-8") for x in cur.fetchall()}
+        new_subcats = set()
+        for sc in subcats:
+            new_subcats |= all_subcats(conn, sc)
+        return subcats | new_subcats
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Find red links in Wikipedia XML dump.")
-    parser.add_argument("-v", action="store_true", help="Verbose logging")
-    parser.add_argument("category", help="Category to search")
-    parser.add_argument("dump", help="path to XML dump file")
-    args = parser.parse_args()
+def main(host, port, db, category):
+    conn = pymysql.connect(
+        database=db,
+        host=host,
+        port=port,
+        read_default_file=os.path.expanduser("~/replica.my.cnf"),
+        charset="utf8mb4",
+    )
 
-    level = logging.INFO
-    if args.v:
-        level = logging.DEBUG
-    logging.basicConfig(level=level)
+    try:
+        conn.begin()
+        cats = set([category]) | all_subcats(conn, category)
+        logging.debug(
+            "Got {} categories total. Getting redlinks.".format(len(cats))
+        )
+        for rl in redlinks(conn, cats):
+            print("* {} [[{}]]".format(rl.n, rl.title.replace("_", " ")))
 
-    links = sort_links_desc(find_red_links(args.category, args.dump))
-
-    for title, link_count in links:
-        print("* {} [[{}]]".format(link_count, title))
+    finally:
+        conn.commit()
+        conn.close()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-v", action="store_true", help="Verbose logging")
+    parser.add_argument("category", help="Category to search for red links")
+    parser.add_argument("--dbhost", default="127.0.0.1", help="(default: %(default)s)")
+    parser.add_argument("--dbport", default="4711", help="(default: %(default)s)")
+    parser.add_argument("--dbname", default="dawiki_p", help="(default: %(default)s)")
+    args = parser.parse_args()
+
+    if args.v:
+        logging.basicConfig(level=logging.DEBUG)
+
+    main(
+        host=args.dbhost,
+        port=args.dbport,
+        db=args.dbname,
+        category=args.category,
+    )
